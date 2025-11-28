@@ -8,29 +8,30 @@
   - Usa WiFi + PubSubClient (MQTT)
 */
 
+#include <Arduino.h>
 #include <WiFi.h>
-#include <PubSubClient.h>
+#include <ESP32MQTTClient.h>
 
 // ========== CONFIG ========
 const char* ssid        = "DESKTOP-RTTQ50L 0411";
 const char* wifiPass    = "574;Cm23";
 
-String mqtt_server = "";          // se pedirá por Serial al inicio
+char* mqtt_server = "";          // se pedirá por Serial al inicio
 const uint16_t mqtt_port = 1883;
 
-const char* tempTopic   = "home/esp32/temperature";
-const char* proxTopic   = "home/esp32/proximity";
+const char* tempTopic   = "esp32/temperature";
+const char* proxTopic   = "esp32/proximity";
 
 const unsigned long TEMP_PUBLISH_INTERVAL = 1000UL; // publicar temp cada 1s
 const unsigned long PROX_DEBOUNCE_MS = 200; // debounce de proximidad en ms
 // ==========================
 
 // Pines
-const uint8_t TEMP_PIN = A0; // pin entrada analógica del sensor de temperatura
+const uint8_t TEMP_PIN = 23; // pin entrada analógica del sensor de temperatura
 const uint8_t PROX_PIN = 15; // pin entrada digital del sensor de proximidad
 
-WiFiClient espClient;
-PubSubClient client(espClient);
+WiFiClient wifiClient;  
+ESP32MQTTClient mqttClient;
 
 unsigned long lastTempPublish = 0;
 unsigned long lastProxPublish = 0;
@@ -43,6 +44,29 @@ void IRAM_ATTR proxISR() {
 }
 
 // ---------- Helpers ----------
+// Required global callback for connection events
+void onMqttConnect(esp_mqtt_client_handle_t client) {
+  if (mqttClient.isMyTurn(client)) {
+    // Subscribe to topics here
+    mqttClient.subscribe("test/topic", [](const std::string &payload) {
+      Serial.printf("Received: %s\n", payload.c_str());
+    });
+  }
+}
+
+// Required global event handler - ESP-IDF version dependent
+#if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
+esp_err_t handleMQTT(esp_mqtt_event_handle_t event) {
+  mqttClient.onEventCallback(event);
+  return ESP_OK;
+}
+#else
+void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, void *event_data) {
+  auto *event = static_cast<esp_mqtt_event_handle_t>(event_data);
+  mqttClient.onEventCallback(event);
+}
+#endif
+
 void setupWiFi() {
   Serial.print("Conectando a WiFi: ");
   Serial.println(ssid);
@@ -62,56 +86,20 @@ void setupWiFi() {
   Serial.println(WiFi.localIP());
 }
 
-// Reconexión MQTT usando mqtt_server (String)
-void reconnectMQTT() {
-  if (client.connected()) return;
-  if (mqtt_server.length() == 0) {
-    Serial.println("Broker MQTT no configurado.");
-    return;
-  }
-
-  Serial.print("Conectando al broker MQTT: ");
-  Serial.print(mqtt_server);
-  Serial.print(":");
-  Serial.println(mqtt_port);
-
-  client.setServer(mqtt_server.c_str(), mqtt_port);
-  String clientId = "ESP32-";
-  clientId += String((uint32_t)esp_random(), HEX);
-
-  bool ok;
-  if (strlen(mqtt_user) > 0) ok = client.connect(clientId.c_str(), mqtt_user, mqtt_pass);
-  else ok = client.connect(clientId.c_str());
-
-  if (ok) {
-    Serial.println("Conectado al broker MQTT");
-  } else {
-    Serial.print("Fallo al conectar MQTT, rc=");
-    Serial.println(client.state());
-    delay(3000);
-  }
-}
-
 void publishTemperature() {
-  sensors.requestTemperatures();
-  float tempC = sensors.getTempCByIndex(0);
-  if (tempC == DEVICE_DISCONNECTED_C) {
-    Serial.println("Error: DS18B20 desconectado");
-    return;
-  }
-
+  float tempC = AnalogRead(TEMP_PIN);
+  Serial.print(tempC);
   char payload[96];
-  unsigned long t = millis();
-  snprintf(payload, sizeof(payload), "{\"temperature\":%.2f,\"ts\":%lu}", tempC, t);
+  snprintf(payload, sizeof(payload), "%.2f", tempC);
 
-  bool ok = client.publish(tempTopic, payload, true);
+  bool ok = mqttClient.publish(tempTopic, payload, 0, false);
   Serial.print("Publicado temp: ");
   Serial.print(payload);
   Serial.print(" -> ");
   Serial.println(ok ? "OK" : "FALLA");
 }
 
-void publishProximityEvent() {
+/*void publishProximityEvent() {
   unsigned long t = millis();
   char payload[96];
   snprintf(payload, sizeof(payload), "{\"proximity\":1,\"ts\":%lu}", t);
@@ -120,7 +108,7 @@ void publishProximityEvent() {
   Serial.print(payload);
   Serial.print(" -> ");
   Serial.println(ok ? "OK" : "FALLA");
-}
+}*/
 
 // Lee una línea desde Serial (hasta '\n') y la devuelve recortada.
 // Si Serial no está abierta en el monitor, esperar hasta que haya datos.
@@ -135,6 +123,7 @@ String readSerialLineBlocking(const char* prompt) {
     s = Serial.readStringUntil('\n');
     s.trim();
   }
+  s = "mqtt://" + s + ":1883";
   return s;
 }
 
@@ -146,18 +135,14 @@ void setup() {
   // Pedir al usuario por Serial la dirección del broker MQTT
   Serial.println();
   Serial.println("== Configuración MQTT ==");
-  Serial.println("Introduce la IP o dominio del broker MQTT y pulsa ENTER.");
-  Serial.println("Ejemplo: 192.168.1.20   o   broker.example.com");
-  Serial.println("(No continuar hasta que escribas la dirección)");
+  Serial.println("Introduce la IP o dominio del broker MQTT.");
 
-  mqtt_server = readSerialLineBlocking("Broker MQTT > ");
+  String brokerip = readSerialLineBlocking("Broker MQTT > ");
   Serial.print("Broker configurado en: ");
-  Serial.println(mqtt_server);
-
-  // Inicializar sensor de temperatura
-  sensors.begin();
+  Serial.println(brokerip);
 
   // Pin sensor proximidad
+  pinMode(TEMP_PIN, INPUT);
   pinMode(PROX_PIN, INPUT); // si tu sensor necesita pullup usa INPUT_PULLUP
 
   // Adjuntar ISR para flanco ascendente (cuando la salida pasa a HIGH)
@@ -167,8 +152,9 @@ void setup() {
   setupWiFi();
 
   // Inicializar MQTT y conectar
-  client.setServer(mqtt_server.c_str(), mqtt_port);
-  reconnectMQTT();
+  mqttClient.setURI(brokerip.c_str());
+  mqttClient.setMqttClientName("ESP32_Client");
+  mqttClient.loopStart();
 
   lastTempPublish = millis() - TEMP_PUBLISH_INTERVAL; // publicar inmediatamente al arrancar
 }
@@ -179,16 +165,11 @@ void loop() {
     Serial.println("WiFi perdido, reconectando...");
     setupWiFi();
   }
-  if (!client.connected()) {
-    reconnectMQTT();
-  }
-  client.loop();
-
   unsigned long now = millis();
 
   // Publicación periódica de temperatura
   if (now - lastTempPublish >= TEMP_PUBLISH_INTERVAL) {
-    if (client.connected()) publishTemperature();
+    if (mqttClient.isConnected()) publishTemperature();
     lastTempPublish = now;
   }
 
@@ -201,7 +182,7 @@ void loop() {
     if (digitalRead(PROX_PIN) == HIGH) {
       // Evitar rebotes: si publicamos muy recientemente, ignorar
       if (now - lastProxPublish >= PROX_DEBOUNCE_MS) {
-        if (client.connected()) publishProximityEvent();
+        //if (mqttClient.isConnected()) publishProximityEvent();
         lastProxPublish = now;
       } else {
         Serial.println("Proximity trigger ignorado por debounce.");
