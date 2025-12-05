@@ -3,9 +3,9 @@
   (Solicita la IP/dominio del broker por Serial al iniciar)
 
   - Lee temperatura y publica la temperatura de forma periódica
-  - Lee una entrada digital para sensor de proximidad y publica un evento cuando la entrada pasa a HIGH
+  - Lee una entrada digital para sensor de proximidad y publica true/false según detección
   - Pide por Serial la dirección (IP o dominio) del broker MQTT al arrancar
-  - Usa WiFi + PubSubClient (MQTT)
+  - Usa WiFi + ESP32MQTTClient
 */
 
 #include <Arduino.h>
@@ -16,7 +16,7 @@
 const char* ssid        = "DESKTOP-RTTQ50L 0411";
 const char* wifiPass    = "574;Cm23";
 
-char* mqtt_server = "";          // se pedirá por Serial al inicio
+char mqtt_server[50] = "";  // se pedirá por Serial al inicio
 const uint16_t mqtt_port = 1883;
 
 const char* tempTopic   = "esp32/temperature";
@@ -27,34 +27,114 @@ const unsigned long PROX_DEBOUNCE_MS = 200; // debounce de proximidad en ms
 // ==========================
 
 // Pines
-const uint8_t TEMP_PIN = 23; // pin entrada analógica del sensor de temperatura
-const uint8_t PROX_PIN = 15; // pin entrada digital del sensor de proximidad
+const uint8_t TEMP_PIN = 34;    // Pin entrada analógica (ADC1)
+const uint8_t PROX_PIN = 15;    // Pin entrada digital del sensor de proximidad
 
-WiFiClient wifiClient;  
 ESP32MQTTClient mqttClient;
 
 unsigned long lastTempPublish = 0;
-unsigned long lastProxPublish = 0;
+unsigned long lastProxChange = 0;
 
-// ISR-safe flag para indicar trigger de proximidad (se procesará en loop)
-volatile bool proxTriggered = false;
-
-void IRAM_ATTR proxISR() {
-  proxTriggered = true;
-}
+// Variables para el sensor de proximidad
+bool lastProxState = false;
+bool currentProxState = false;
+bool proxTriggered = false;
 
 // ---------- Helpers ----------
+void setupWiFi() {
+  Serial.print("Conectando a WiFi: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, wifiPass);
+  
+  unsigned long start = millis();
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+    if (millis() - start > 20000) {
+      Serial.println("\nTimeout WiFi. Reintentando...");
+      start = millis();
+      WiFi.begin(ssid, wifiPass);
+    }
+  }
+  
+  Serial.println();
+  Serial.print("WiFi conectado. IP: ");
+  Serial.println(WiFi.localIP());
+}
+
+// Simula lectura de temperatura (reemplaza con tu sensor real)
+float readTemperature() {
+  // Para LM35 (10mV por °C) con ESP32 (3.3V, 12-bit ADC = 4095)
+  // int raw = analogRead(TEMP_PIN);
+  // float voltage = raw * (3.3 / 4095.0);
+  // return voltage * 100.0; // LM35: 10mV por °C
+  
+  // Simulación - reemplaza con tu sensor real
+  static float temp = 25.0;
+  temp += (random(-10, 11) / 10.0); // Pequeña variación aleatoria
+  if (temp < 20.0) temp = 20.0;
+  if (temp > 35.0) temp = 35.0;
+  return temp;
+}
+
+void publishTemperature() {
+  float tempC = readTemperature();
+  
+  char payload[32];
+  snprintf(payload, sizeof(payload), "%.2f", tempC);
+  
+  bool ok = mqttClient.publish(tempTopic, payload, 0, false);
+  
+  Serial.print("Publicado temperatura: ");
+  Serial.print(payload);
+  Serial.print("°C -> ");
+  Serial.println(ok ? "OK" : "FALLA");
+}
+
+void publishProximityState(bool detected) {
+  // Publica "true" si hay objeto, "false" si no hay
+  const char* payload = detected ? "true" : "false";
+  
+  bool ok = mqttClient.publish(proxTopic, payload, 0, false);
+  
+  Serial.print("Publicado proximidad: ");
+  Serial.print(payload);
+  Serial.print(" -> ");
+  Serial.println(ok ? "OK" : "FALLA");
+}
+
+// Función para leer sensor de proximidad con debounce
+bool readProximitySensor() {
+  // Leer el pin - para sensor NPN normalmente abierto: LOW = detectado
+  bool rawState = (digitalRead(PROX_PIN) == LOW); // TRUE cuando detecta objeto
+  
+  unsigned long now = millis();
+  
+  // Debounce simple
+  if (rawState != currentProxState) {
+    if (now - lastProxChange > PROX_DEBOUNCE_MS) {
+      currentProxState = rawState;
+      lastProxChange = now;
+      proxTriggered = true;
+    }
+  }
+  
+  return currentProxState;
+}
+
 // Required global callback for connection events
 void onMqttConnect(esp_mqtt_client_handle_t client) {
   if (mqttClient.isMyTurn(client)) {
-    // Subscribe to topics here
-    mqttClient.subscribe("test/topic", [](const std::string &payload) {
-      Serial.printf("Received: %s\n", payload.c_str());
-    });
+    Serial.println("MQTT conectado!");
+    
+    // Opcional: Suscribirse a topics si es necesario
+    // mqttClient.subscribe("test/topic", [](const std::string &payload) {
+    //   Serial.printf("Recibido: %s\n", payload.c_str());
+    // });
   }
 }
 
-// Required global event handler - ESP-IDF version dependent
+// Required global event handler
 #if ESP_IDF_VERSION < ESP_IDF_VERSION_VAL(5, 0, 0)
 esp_err_t handleMQTT(esp_mqtt_event_handle_t event) {
   mqttClient.onEventCallback(event);
@@ -67,63 +147,32 @@ void handleMQTT(void *handler_args, esp_event_base_t base, int32_t event_id, voi
 }
 #endif
 
-void setupWiFi() {
-  Serial.print("Conectando a WiFi: ");
-  Serial.println(ssid);
-  WiFi.begin(ssid, wifiPass);
-  unsigned long start = millis();
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-    if (millis() - start > 20000) {
-      Serial.println("\nTimeout WiFi. Reintentando...");
-      start = millis();
-      WiFi.begin(ssid, wifiPass);
-    }
-  }
-  Serial.println();
-  Serial.print("WiFi conectado. IP: ");
-  Serial.println(WiFi.localIP());
-}
-
-void publishTemperature() {
-  float tempC = AnalogRead(TEMP_PIN);
-  Serial.print(tempC);
-  char payload[96];
-  snprintf(payload, sizeof(payload), "%.2f", tempC);
-
-  bool ok = mqttClient.publish(tempTopic, payload, 0, false);
-  Serial.print("Publicado temp: ");
-  Serial.print(payload);
-  Serial.print(" -> ");
-  Serial.println(ok ? "OK" : "FALLA");
-}
-
-/*void publishProximityEvent() {
-  unsigned long t = millis();
-  char payload[96];
-  snprintf(payload, sizeof(payload), "{\"proximity\":1,\"ts\":%lu}", t);
-  bool ok = client.publish(proxTopic, payload);
-  Serial.print("Publicado proximidad: ");
-  Serial.print(payload);
-  Serial.print(" -> ");
-  Serial.println(ok ? "OK" : "FALLA");
-}*/
-
-// Lee una línea desde Serial (hasta '\n') y la devuelve recortada.
-// Si Serial no está abierta en el monitor, esperar hasta que haya datos.
+// Lee una línea desde Serial
 String readSerialLineBlocking(const char* prompt) {
   Serial.println(prompt);
   String s = "";
-  while (s.length() == 0) {
-    // esperar hasta que el usuario escriba algo y pulse ENTER
-    while (!Serial.available()) {
-      delay(10);
+  unsigned long timeout = millis() + 30000; // 30 segundos timeout
+  
+  while (millis() < timeout) {
+    if (Serial.available()) {
+      char c = Serial.read();
+      if (c == '\n' || c == '\r') {
+        if (s.length() > 0) {
+          s.trim();
+          break;
+        }
+      } else {
+        s += c;
+      }
     }
-    s = Serial.readStringUntil('\n');
-    s.trim();
+    delay(10);
   }
-  s = "mqtt://" + s + ":1883";
+  
+  if (s.length() == 0) {
+    s = "192.168.1.100"; // IP por defecto
+    Serial.println("Usando IP por defecto: " + s);
+  }
+  
   return s;
 }
 
@@ -131,67 +180,78 @@ String readSerialLineBlocking(const char* prompt) {
 void setup() {
   Serial.begin(115200);
   delay(100);
-
+  
+  Serial.println("\n\n=== Sistema MQTT Temperatura/Proximidad ===");
+  
   // Pedir al usuario por Serial la dirección del broker MQTT
-  Serial.println();
-  Serial.println("== Configuración MQTT ==");
-  Serial.println("Introduce la IP o dominio del broker MQTT.");
-
+  Serial.println("\n== Configuración MQTT ==");
+  Serial.println("Introduce la IP del broker MQTT (ej: 192.168.1.100)");
+  Serial.println("Presiona Enter para usar valor por defecto");
+  
   String brokerip = readSerialLineBlocking("Broker MQTT > ");
-  Serial.print("Broker configurado en: ");
-  Serial.println(brokerip);
-
-  // Pin sensor proximidad
+  brokerip.toCharArray(mqtt_server, sizeof(mqtt_server));
+  
+  if (brokerip.length() > 0 && !brokerip.startsWith("mqtt://")) {
+    String fullAddr = "mqtt://" + brokerip + ":1883";
+    fullAddr.toCharArray(mqtt_server, sizeof(mqtt_server));
+  }
+  
+  Serial.print("Broker configurado: ");
+  Serial.println(mqtt_server);
+  
+  // Configurar pines
   pinMode(TEMP_PIN, INPUT);
-  pinMode(PROX_PIN, INPUT); // si tu sensor necesita pullup usa INPUT_PULLUP
-
-  // Adjuntar ISR para flanco ascendente (cuando la salida pasa a HIGH)
-  attachInterrupt(digitalPinToInterrupt(PROX_PIN), proxISR, RISING);
-
+  pinMode(PROX_PIN, INPUT_PULLUP); // Pull-up interno para sensor NPN
+  
   // Conectar WiFi
   setupWiFi();
-
-  // Inicializar MQTT y conectar
-  mqttClient.setURI(brokerip.c_str());
-  mqttClient.setMqttClientName("ESP32_Client");
+  
+  // Configurar MQTT
+  mqttClient.setURI(mqtt_server);
+  mqttClient.setMqttClientName("ESP32_Sensor_Client");
   mqttClient.loopStart();
-
-  lastTempPublish = millis() - TEMP_PUBLISH_INTERVAL; // publicar inmediatamente al arrancar
+  
+  Serial.println("\nSistema inicializado. Publicando datos...");
+  lastTempPublish = millis() - TEMP_PUBLISH_INTERVAL;
 }
 
 void loop() {
-  // Mantener MQTT y WiFi
+  unsigned long now = millis();
+  
+  // Leer sensor de proximidad (polling en lugar de interrupción)
+  bool proximityDetected = readProximitySensor();
+  
+  // Publicar cambio de estado de proximidad
+  if (proxTriggered) {
+    if (mqttClient.isConnected()) {
+      publishProximityState(proximityDetected);
+    } else {
+      Serial.println("MQTT no conectado, no se puede publicar proximidad");
+    }
+    
+    // Mostrar por serial
+    Serial.print("Estado proximidad cambiado: ");
+    Serial.println(proximityDetected ? "true (OBJETO DETECTADO)" : "false (NO DETECTADO)");
+    
+    proxTriggered = false;
+  }
+  
+  // Publicación periódica de temperatura
+  if (now - lastTempPublish >= TEMP_PUBLISH_INTERVAL) {
+    if (mqttClient.isConnected()) {
+      publishTemperature();
+    } else {
+      Serial.println("MQTT no conectado, no se puede publicar temperatura");
+    }
+    lastTempPublish = now;
+  }
+  
+  // Mantener conexión WiFi
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("WiFi perdido, reconectando...");
     setupWiFi();
   }
-  unsigned long now = millis();
-
-  // Publicación periódica de temperatura
-  if (now - lastTempPublish >= TEMP_PUBLISH_INTERVAL) {
-    if (mqttClient.isConnected()) publishTemperature();
-    lastTempPublish = now;
-  }
-
-  // Manejo del trigger de proximidad (evitar publicar desde ISR)
-  if (proxTriggered) {
-    // Desactivar la bandera lo antes posible
-    proxTriggered = false;
-
-    // Leer el pin para asegurarnos que sigue en HIGH (debounce simple)
-    if (digitalRead(PROX_PIN) == HIGH) {
-      // Evitar rebotes: si publicamos muy recientemente, ignorar
-      if (now - lastProxPublish >= PROX_DEBOUNCE_MS) {
-        //if (mqttClient.isConnected()) publishProximityEvent();
-        lastProxPublish = now;
-      } else {
-        Serial.println("Proximity trigger ignorado por debounce.");
-      }
-    } else {
-      Serial.println("Proximity trigger detectado pero pin no está HIGH (rebote).");
-    }
-  }
-
+  
   // Pequeña pausa
   delay(10);
 }
