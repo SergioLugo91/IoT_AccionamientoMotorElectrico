@@ -11,6 +11,9 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <ESP32MQTTClient.h>
+#include <Adafruit_Sensor.h>
+#include <DHT.h>
+#include <DHT_U.h>
 
 // ========== CONFIG ========
 const char* ssid        = "DESKTOP-RTTQ50L 0411";
@@ -27,10 +30,12 @@ const unsigned long PROX_DEBOUNCE_MS = 200; // debounce de proximidad en ms
 // ==========================
 
 // Pines
-const uint8_t TEMP_PIN = 34;    // Pin entrada analógica (ADC1)
+const uint8_t TEMP_PIN = 34;    // Pin entrada digital del sensor de temperatura
 const uint8_t PROX_PIN = 15;    // Pin entrada digital del sensor de proximidad
 
 ESP32MQTTClient mqttClient;
+
+DHT_Unified dht(TEMP_PIN, DHT11);
 
 unsigned long lastTempPublish = 0;
 unsigned long lastProxChange = 0;
@@ -46,6 +51,8 @@ void setupWiFi() {
   Serial.println(ssid);
   WiFi.begin(ssid, wifiPass);
   
+  pinMode(PROX_PIN,INPUT);
+
   unsigned long start = millis();
   while (WiFi.status() != WL_CONNECTED) {
     delay(300);
@@ -62,19 +69,11 @@ void setupWiFi() {
   Serial.println(WiFi.localIP());
 }
 
-// Simula lectura de temperatura (reemplaza con tu sensor real)
 float readTemperature() {
-  // Para LM35 (10mV por °C) con ESP32 (3.3V, 12-bit ADC = 4095)
-  // int raw = analogRead(TEMP_PIN);
-  // float voltage = raw * (3.3 / 4095.0);
-  // return voltage * 100.0; // LM35: 10mV por °C
-  
-  // Simulación - reemplaza con tu sensor real
-  static float temp = 25.0;
-  temp += (random(-10, 11) / 10.0); // Pequeña variación aleatoria
-  if (temp < 20.0) temp = 20.0;
-  if (temp > 35.0) temp = 35.0;
-  return temp;
+  sensors_event_t event;
+  dht.temperature().getEvent(&event);
+  float Temperature = event.temperature;
+  return Temperature;
 }
 
 void publishTemperature() {
@@ -106,7 +105,7 @@ void publishProximityState(bool detected) {
 // Función para leer sensor de proximidad con debounce
 bool readProximitySensor() {
   // Leer el pin - para sensor NPN normalmente abierto: LOW = detectado
-  bool rawState = (digitalRead(PROX_PIN) == LOW); // TRUE cuando detecta objeto
+  bool rawState = (digitalRead(PROX_PIN) == HIGH); // TRUE cuando detecta objeto
   
   unsigned long now = millis();
   
@@ -126,11 +125,6 @@ bool readProximitySensor() {
 void onMqttConnect(esp_mqtt_client_handle_t client) {
   if (mqttClient.isMyTurn(client)) {
     Serial.println("MQTT conectado!");
-    
-    // Opcional: Suscribirse a topics si es necesario
-    // mqttClient.subscribe("test/topic", [](const std::string &payload) {
-    //   Serial.printf("Recibido: %s\n", payload.c_str());
-    // });
   }
 }
 
@@ -218,7 +212,7 @@ void setup() {
 void loop() {
   unsigned long now = millis();
   
-  // Leer sensor de proximidad (polling en lugar de interrupción)
+  // Leer sensor de proximidad
   bool proximityDetected = readProximitySensor();
   
   // Publicar cambio de estado de proximidad

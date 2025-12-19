@@ -459,6 +459,7 @@ void autoControl() {
       // Si detecta objeto y está en velocidad rápida, cambiar a lenta
       Serial.println("Objeto detectado. Cambiando a velocidad lenta.");
       setSlowSpeed();
+      return;
     } else if (!lastProx && motorState == STATE_SLOW) {
       // Si no hay objeto y está en lenta, cambiar a rápida
       Serial.println("Sin objetos. Cambiando a velocidad rápida.");
@@ -466,9 +467,9 @@ void autoControl() {
     }
   }
   
-  // Si está apagado y no hay condiciones críticas, encender en velocidad rápida
+  // Si está apagado y no hay condiciones críticas, encender en velocidad lenta
   if (motorState == STATE_OFF && lastTemp <= TEMP_UMBRAL) {
-    setFastSpeed();
+    setSlowSpeed();
   }
 }
 
@@ -548,6 +549,14 @@ void loop() {
   if (millis() - lastLCDUpdate >= 1000) {
     updateLCD();
     lastLCDUpdate = millis();
+  }
+
+  // Asegurar que si el motor está apagado el resto de relés estén apagados
+  if (!stateRelL1) {
+    stateRelL2 = false;
+    stateRelL3 = false;
+    stateRelL4 = false;
+    applyRelayStates();
   }
   
   delay(10);
